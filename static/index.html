@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDF Tools</title>
+<style>
+  :root { --bg:#f6f5f2; --card:#fff; --ink:#1d1d1f; --muted:#6b6b70; --accent:#c2410c; --line:#e3e1dc; --ok:#15803d; --err:#b91c1c; }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; font: 16px/1.5 "Segoe UI", system-ui, sans-serif; background: var(--bg); color: var(--ink); }
+  main { max-width: 760px; margin: 40px auto; padding: 0 16px; }
+  h1 { font-size: 28px; margin: 0 0 20px; }
+  .tabs { display: flex; flex-wrap: wrap; gap: 4px; border-bottom: 1px solid var(--line); }
+  .tabs button { border: 0; background: none; padding: 10px 14px; font: inherit; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; }
+  .tabs button.active { color: var(--ink); border-color: var(--accent); }
+  .card { background: var(--card); border: 1px solid var(--line); border-top: 0; border-radius: 0 0 10px 10px; padding: 20px; }
+  .hint { color: var(--muted); font-size: 14px; margin-top: 0; }
+  .drop { border: 2px dashed var(--line); border-radius: 10px; padding: 28px; text-align: center; color: var(--muted); cursor: pointer; }
+  .drop.over { border-color: var(--accent); color: var(--ink); }
+  ul.files { list-style: none; padding: 0; margin: 12px 0; }
+  ul.files li { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 6px 10px; margin-bottom: 4px; border: 1px solid var(--line); border-radius: 6px; cursor: grab; }
+  ul.files li.dragging { opacity: .4; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 12px 0; }
+  input[type=text], select { flex: 1; min-width: 0; font: inherit; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; }
+  button.primary { background: var(--accent); color: #fff; border: 0; border-radius: 6px; padding: 10px 18px; font: inherit; cursor: pointer; }
+  button.secondary { background: #fff; border: 1px solid var(--line); border-radius: 6px; padding: 6px 12px; font: inherit; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: wait; }
+  .divider { text-align: center; color: var(--muted); font-size: 14px; margin: 20px 0 8px; }
+  .status { margin-top: 14px; white-space: pre-wrap; }
+  .status.ok { color: var(--ok); }
+  .status.err { color: var(--err); }
+</style>
+</head>
+<body>
+<main>
+  <h1>PDF Tools</h1>
+  <nav class="tabs"></nav>
+  <div id="panels"></div>
+</main>
+
+<template id="panel-tpl">
+  <section class="card">
+    <p class="hint"></p>
+    <div class="drop">Перетащи файлы сюда или нажми, чтобы выбрать</div>
+    <input type="file" hidden>
+    <ul class="files"></ul>
+    <div class="row opt-level" hidden>
+      <label>Сжатие:</label>
+      <select class="level">
+        <option value="light">лёгкое (200 DPI)</option>
+        <option value="medium" selected>среднее (150 DPI)</option>
+        <option value="strong">сильное (100 DPI)</option>
+      </select>
+    </div>
+    <div class="row opt-meta" hidden>
+      <input type="text" class="title" placeholder="Название (пусто — из PDF)">
+      <input type="text" class="author" placeholder="Автор (пусто — из PDF)">
+    </div>
+    <button class="primary run-upload">Сделать из выбранных файлов</button>
+    <div class="divider">— или целой папкой —</div>
+    <div class="row">
+      <input type="text" class="path" placeholder="C:\путь\к\папке">
+      <button class="secondary pick">Выбрать папку…</button>
+    </div>
+    <button class="primary run-folder">Обработать папку</button>
+    <div class="status"></div>
+  </section>
+</template>
+
+<script>
+const TOOLS = {
+  images: { label: "Картинки → PDF", accept: "image/jpeg,image/gif,image/png,image/webp", multiple: true,
+            upload: "/api/images-to-pdf",
+            hint: "Все картинки склеиваются в один PDF по порядку номеров. Папка → готово/<имя папки>.pdf" },
+  merge:  { label: "Объединить PDF", accept: "application/pdf", multiple: true, upload: "/api/merge",
+            hint: "PDF склеиваются по порядку номеров. Папка → готово/<имя папки>.pdf" },
+  compress: { label: "Сжать PDF", accept: "application/pdf", multiple: false, upload: "/api/compress", options: "level",
+            hint: "Пережимаются картинки внутри PDF, текст остаётся текстом. Папка → каждый файл в готово/ с тем же именем" },
+  epub:   { label: "PDF → EPUB", accept: "application/pdf", multiple: false, upload: "/api/epub", options: "meta",
+            hint: "Текст для читалки на телефоне. Название/автор — только для одного файла; папка → готово/<имя>.epub" },
+};
+const state = {};
+const $ = (sel, el = document) => el.querySelector(sel);
+const byNumber = (a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" });
+
+function fmtSize(n) {
+  return n < 1024 * 1024 ? `${Math.round(n / 1024)} КБ` : `${(n / 1024 / 1024).toFixed(1)} МБ`;
+}
+function setStatus(sec, text, kind = "") {
+  const s = $(".status", sec);
+  s.textContent = text;
+  s.className = `status ${kind}`;
+}
+function filenameFrom(resp, fallback) {
+  const m = (resp.headers.get("Content-Disposition") || "").match(/filename\*=UTF-8''([^;]+)/i);
+  return m ? decodeURIComponent(m[1]) : fallback;
+}
+function download(blob, name) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+async function errorText(resp) {
+  try { const d = await resp.json(); return d.error || d.detail || `Ошибка ${resp.status}`; }
+  catch { return `Ошибка ${resp.status}`; }
+}
+async function busy(sec, fn) {
+  const buttons = sec.querySelectorAll("button");
+  buttons.forEach(b => b.disabled = true);
+  setStatus(sec, "Работаю…");
+  try { await fn(); }
+  catch (e) { setStatus(sec, `Не удалось связаться с программой: ${e.message}`, "err"); }
+  finally { buttons.forEach(b => b.disabled = false); }
+}
+
+function render(key, sec) {
+  const list = $("ul.files", sec);
+  list.innerHTML = "";
+  state[key].forEach((file, i) => {
+    const li = document.createElement("li");
+    li.draggable = true;
+    const label = document.createElement("span");
+    label.textContent = `${i + 1}. ${file.name} — ${fmtSize(file.size)}`;
+    const remove = document.createElement("button");
+    remove.className = "secondary";
+    remove.textContent = "✕";
+    remove.title = "Убрать";
+    remove.onclick = () => { state[key].splice(i, 1); render(key, sec); };
+    li.append(label, remove);
+    li.addEventListener("dragstart", e => { e.dataTransfer.setData("text/plain", String(i)); li.classList.add("dragging"); });
+    li.addEventListener("dragend", () => li.classList.remove("dragging"));
+    li.addEventListener("dragover", e => e.preventDefault());
+    li.addEventListener("drop", e => {
+      e.preventDefault();
+      const from = Number(e.dataTransfer.getData("text/plain"));
+      if (Number.isNaN(from)) return;
+      const [moved] = state[key].splice(from, 1);
+      state[key].splice(i, 0, moved);
+      render(key, sec);
+    });
+    list.append(li);
+  });
+}
+
+async function runUpload(key, sec) {
+  const tool = TOOLS[key], files = state[key];
+  if (!files.length) return setStatus(sec, "Сначала добавь файлы", "err");
+  const form = new FormData();
+  for (const f of files) form.append(tool.multiple ? "files" : "file", f);
+  if (tool.options === "level") form.append("level", $(".level", sec).value);
+  if (tool.options === "meta") { form.append("title", $(".title", sec).value); form.append("author", $(".author", sec).value); }
+  await busy(sec, async () => {
+    const resp = await fetch(tool.upload, { method: "POST", body: form });
+    if (!resp.ok) return setStatus(sec, await errorText(resp), "err");
+    const name = filenameFrom(resp, "result");
+    download(await resp.blob(), name);
+    let msg = `Готово: ${name}`;
+    const before = resp.headers.get("X-Original-Size"), after = resp.headers.get("X-New-Size");
+    if (before) msg += `\nРазмер: ${fmtSize(+before)} → ${fmtSize(+after)}`;
+    setStatus(sec, msg, "ok");
+  });
+}
+
+function setPath(value) {
+  document.querySelectorAll(".path").forEach(input => input.value = value);
+}
+
+async function pickFolder(sec) {
+  await busy(sec, async () => {
+    const resp = await fetch("/api/pick-folder", { method: "POST" });
+    const data = await resp.json();
+    if (data.path) setPath(data.path);
+    setStatus(sec, "");
+  });
+}
+
+async function runFolder(key, sec) {
+  const path = $(".path", sec).value.trim();
+  if (!path) return setStatus(sec, "Укажи папку", "err");
+  await busy(sec, async () => {
+    const resp = await fetch(`/api/folder/${key}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, level: $(".level", sec).value }),
+    });
+    if (!resp.ok) return setStatus(sec, await errorText(resp), "err");
+    const data = await resp.json();
+    setStatus(sec, "Создано:\n" + data.created.join("\n"), "ok");
+  });
+}
+
+function wire(key, sec) {
+  const tool = TOOLS[key], drop = $(".drop", sec), input = $("input[type=file]", sec);
+  const add = fileList => {
+    const picked = [...fileList];
+    state[key] = tool.multiple ? [...state[key], ...picked] : picked.slice(0, 1);
+    state[key].sort(byNumber);
+    render(key, sec);
+  };
+  drop.addEventListener("click", () => input.click());
+  input.addEventListener("change", () => { add(input.files); input.value = ""; });
+  drop.addEventListener("dragover", e => { e.preventDefault(); drop.classList.add("over"); });
+  drop.addEventListener("dragleave", () => drop.classList.remove("over"));
+  drop.addEventListener("drop", e => { e.preventDefault(); drop.classList.remove("over"); add(e.dataTransfer.files); });
+  $(".run-upload", sec).addEventListener("click", () => runUpload(key, sec));
+  $(".pick", sec).addEventListener("click", () => pickFolder(sec));
+  $(".run-folder", sec).addEventListener("click", () => runFolder(key, sec));
+  $(".path", sec).addEventListener("input", e => setPath(e.target.value));
+}
+
+function show(key) {
+  document.querySelectorAll(".tabs button").forEach(b => b.classList.toggle("active", b.dataset.tab === key));
+  document.querySelectorAll("#panels section").forEach(s => s.hidden = s.dataset.tool !== key);
+}
+
+function build() {
+  const tabs = $(".tabs"), panels = $("#panels"), tpl = $("#panel-tpl");
+  for (const [key, tool] of Object.entries(TOOLS)) {
+    state[key] = [];
+    const btn = document.createElement("button");
+    btn.textContent = tool.label;
+    btn.dataset.tab = key;
+    tabs.append(btn);
+    const sec = tpl.content.firstElementChild.cloneNode(true);
+    sec.dataset.tool = key;
+    $(".hint", sec).textContent = tool.hint;
+    const input = $("input[type=file]", sec);
+    input.accept = tool.accept;
+    input.multiple = tool.multiple;
+    if (tool.options) $(`.opt-${tool.options}`, sec).hidden = false;
+    panels.append(sec);
+    wire(key, sec);
+  }
+  tabs.addEventListener("click", e => { if (e.target.dataset.tab) show(e.target.dataset.tab); });
+  show("images");
+}
+build();
+</script>
+</body>
+</html>
