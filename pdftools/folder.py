@@ -12,6 +12,7 @@ from .pdf_to_epub import pdf_to_epub
 OUTPUT_DIR = "готово"
 IMAGE_EXTS = {".jpg", ".jpeg", ".gif", ".png", ".webp"}
 PDF_EXTS = {".pdf"}
+READ_ERROR_MSG = "не удалось прочитать файл"
 
 
 def list_files(folder: Path, exts: set[str]) -> list[Path]:
@@ -54,7 +55,7 @@ def _read(paths: list[Path]) -> tuple[list[tuple[str, bytes]], list[str]]:
         try:
             items.append((p.name, p.read_bytes()))
         except OSError:
-            errors.append(f"«{p.name}»: не удалось прочитать файл")
+            errors.append(f"«{p.name}»: {READ_ERROR_MSG}")
     return items, errors
 
 
@@ -88,7 +89,7 @@ def _write_combined(folder: Path, paths: list[Path], combine: Callable, output_n
 
 
 def _write(folder: Path, outputs: dict[str, bytes]) -> list[Path]:
-    """Write outputs to temp files, then atomically replace them."""
+    """Write outputs to temp files (phase 1), then atomically replace them (phase 2)."""
     out = folder / OUTPUT_DIR
     temp_files = []
 
@@ -97,28 +98,29 @@ def _write(folder: Path, outputs: dict[str, bytes]) -> list[Path]:
     except OSError as exc:
         raise PdfToolsError(f"Не удалось сохранить результат: {exc}") from exc
 
+    # Phase 1: Write all temp files, tracking each path before write_bytes
+    for name, data in outputs.items():
+        temp_path = out / (name + ".tmp")
+        temp_files.append(temp_path)
+        try:
+            temp_path.write_bytes(data)
+        except OSError as exc:
+            # Clean up all tracked temp files and raise
+            for tf in temp_files:
+                try:
+                    tf.unlink()
+                except OSError:
+                    pass
+            raise PdfToolsError(f"Не удалось сохранить результат: {exc}") from exc
+
+    # Phase 2: Replace temp files with final names
     try:
-        for name, data in outputs.items():
+        for name in outputs.keys():
             target = out / name
             temp_path = out / (name + ".tmp")
-            try:
-                temp_path.write_bytes(data)
-                temp_files.append(temp_path)
-                os.replace(str(temp_path), str(target))
-            except OSError as exc:
-                # Delete temp files on failure
-                for tf in temp_files:
-                    try:
-                        tf.unlink()
-                    except OSError:
-                        pass
-                raise PdfToolsError(f"Не удалось сохранить результат: {exc}") from exc
-
-        return [out / name for name in outputs.keys()]
-    except PdfToolsError:
-        raise
-    except Exception as exc:
-        # Clean up any remaining temp files
+            os.replace(str(temp_path), str(target))
+    except OSError as exc:
+        # Clean up any remaining temp files and raise
         for tf in temp_files:
             try:
                 tf.unlink()
@@ -126,18 +128,27 @@ def _write(folder: Path, outputs: dict[str, bytes]) -> list[Path]:
                 pass
         raise PdfToolsError(f"Не удалось сохранить результат: {exc}") from exc
 
+    return [out / name for name in outputs.keys()]
+
 
 def _each_pdf(folder: Path, suffix: str, convert: Callable[[Path, bytes], bytes]) -> list[Path]:
     """Обрабатывает все PDF в памяти; если хоть один упал — ничего не пишет."""
     outputs: dict[str, bytes] = {}
     errors: list[str] = []
     for src in list_files(folder, PDF_EXTS):
+        # Phase 1: Read bytes
         try:
-            outputs[f"{src.stem}{suffix}"] = convert(src, src.read_bytes())
+            data = src.read_bytes()
         except OSError:
-            errors.append(f"«{src.name}»: не удалось прочитать файл")
+            errors.append(f"«{src.name}»: {READ_ERROR_MSG}")
+            continue
+
+        # Phase 2: Convert
+        try:
+            outputs[f"{src.stem}{suffix}"] = convert(src, data)
         except PdfToolsError as exc:
             errors.append(str(exc))
+
     if errors:
         raise PdfToolsError(_format_errors(errors))
     return _write(folder, outputs)
