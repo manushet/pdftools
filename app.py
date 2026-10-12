@@ -9,8 +9,10 @@ from urllib.parse import quote
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from pdftools import folder
 from pdftools.compress import compress_pdf
@@ -23,6 +25,38 @@ HOST, PORT = "127.0.0.1", 8765
 STATIC = Path(__file__).parent / "static"
 log = logging.getLogger("pdftools")
 app = FastAPI(title="PDF Tools")
+
+ALLOWED_HOSTS = {f"{HOST}:{PORT}", "localhost:8765"}
+ALLOWED_ORIGINS = {f"http://{HOST}:{PORT}", "http://localhost:8765"}
+
+
+class SecurityMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Check Host header
+        host = request.headers.get("host", "").lower()
+        if host and host not in ALLOWED_HOSTS:
+            return JSONResponse(status_code=403, content={"error": "Запрос отклонён"})
+
+        # For non-GET requests, check Origin header if present
+        if request.method != "GET":
+            origin = request.headers.get("origin", "").lower()
+            if origin and origin not in ALLOWED_ORIGINS:
+                return JSONResponse(status_code=403, content={"error": "Запрос отклонён"})
+
+        return await call_next(request)
+
+
+app.add_middleware(SecurityMiddleware)
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+    return JSONResponse(status_code=422, content={"error": "Не хватает данных в запросе (файлы не выбраны?)"})
+
+
+@app.exception_handler(HTTPException)
+async def _http_exception(request: Request, exc: HTTPException) -> JSONResponse:
+    return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
 
 
 @app.exception_handler(PdfToolsError)
@@ -93,7 +127,10 @@ class FolderRequest(BaseModel):
 
     def folder(self) -> Path:
         # «Копировать как путь» в Проводнике добавляет кавычки
-        return Path(self.path.strip().strip('"'))
+        cleaned = self.path.strip().strip('"')
+        if not cleaned:
+            raise PdfToolsError("Укажи папку")
+        return Path(cleaned)
 
 
 FOLDER_ACTIONS = {

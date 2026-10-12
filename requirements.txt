@@ -1,6 +1,6 @@
 pymupdf>=1.26
 pillow>=11
 ebooklib>=0.18
-fastapi>=0.115
+fastapi>=0.132
 uvicorn>=0.30
 python-multipart>=0.0.9
