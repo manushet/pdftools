@@ -19,8 +19,10 @@ MIN_IMAGE_PX = 50        # картинки меньше — декор, про�
 HEADING_RATIO = 1.2      # во сколько раз шрифт крупнее основного, чтобы считаться заголовком
 H1_RATIO = 1.6
 MAX_HEADING_LEN = 150
+CHUNK_ITEMS = 150        # максимум элементов в одной главе-файле
 SENTENCE_END = tuple('.!?:;…»"”)')
 PAGE_NUMBER = re.compile(r"[-–—\s]*[0-9]{1,4}[-–—\s]*")
+SCAN_MESSAGE = "«{name}»: в PDF нет текста (скан). Распознавание текста пока не поддерживается"
 IMAGE_TYPES = {"jpeg": "image/jpeg", "jpg": "image/jpeg", "png": "image/png", "gif": "image/gif"}
 CSS = """
 body { font-family: serif; line-height: 1.5; }
@@ -55,8 +57,11 @@ def pdf_to_epub(data: bytes, title: str | None = None, author: str | None = None
     try:
         pages = _extract(doc)
         if not any(b.kind == "text" for blocks in pages for b in blocks):
-            raise PdfToolsError(f"«{name}»: в PDF нет текста (скан). Распознавание текста пока не поддерживается")
-        items = _to_items(_drop_running_heads(pages))
+            raise PdfToolsError(SCAN_MESSAGE.format(name=name))
+        blocks = _drop_running_heads(pages)
+        if not any(b.kind == "text" for b in blocks):
+            raise PdfToolsError(SCAN_MESSAGE.format(name=name))
+        items = _to_items(blocks)
         meta = doc.metadata or {}
         book_title = title or (meta.get("title") or "").strip() or Path(name).stem
         book_author = author or (meta.get("author") or "").strip() or None
@@ -188,9 +193,20 @@ def _build_epub(items: list[Item], title: str, author: str | None) -> bytes:
     css = epub.EpubItem(uid="style", file_name="style.css", media_type="text/css", content=CSS)
     book.add_item(css)
 
-    split_level = 1 if any(i.kind == "h" and i.level == 1 for i in items) else 2
+    h1 = sum(1 for i in items if i.kind == "h" and i.level == 1)
+    h2 = sum(1 for i in items if i.kind == "h" and i.level == 2)
+    split_level = 1 if h1 >= 2 else 2 if h2 >= 2 else 0
     sections: list[tuple[str, list[str]]] = [(title, [])]
+    base_title, part = title, 1
     image_n = 0
+
+    def add(markup: str) -> None:
+        nonlocal part
+        if len(sections[-1][1]) >= CHUNK_ITEMS:
+            part += 1
+            sections.append((f"{base_title} — часть {part}", []))
+        sections[-1][1].append(markup)
+
     for item in items:
         if item.kind == "h":
             if item.level == split_level:
@@ -198,15 +214,16 @@ def _build_epub(items: list[Item], title: str, author: str | None) -> bytes:
                     sections.append((item.text, []))
                 else:
                     sections[-1] = (item.text, [])
-            sections[-1][1].append(f"<h{item.level}>{html.escape(item.text)}</h{item.level}>")
+                base_title, part = item.text, 1
+            add(f"<h{item.level}>{html.escape(item.text)}</h{item.level}>")
         elif item.kind == "p":
-            sections[-1][1].append(f"<p>{html.escape(item.text)}</p>")
+            add(f"<p>{html.escape(item.text)}</p>")
         else:
             image_n += 1
             image = _image_item(item, image_n)
             if image:
                 book.add_item(image)
-                sections[-1][1].append(f'<img src="{image.file_name}" alt=""/>')
+                add(f'<img src="{image.file_name}" alt=""/>')
 
     chapters = []
     for n, (chapter_title, parts) in enumerate(sections, 1):
@@ -221,7 +238,7 @@ def _build_epub(items: list[Item], title: str, author: str | None) -> bytes:
     book.toc = chapters
     book.add_item(epub.EpubNcx())
     book.add_item(epub.EpubNav())
-    book.spine = ["nav", *chapters]
+    book.spine = chapters
     buf = io.BytesIO()
     epub.write_epub(buf, book)
     return buf.getvalue()
