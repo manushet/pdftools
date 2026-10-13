@@ -4,17 +4,20 @@ import pymupdf
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from .errors import PdfToolsError
+from .progress import Progress, no_progress
 
 _EXIF_ORIENTATION = 0x0112
 _JPEG_FORMATS = ("JPEG", "MPO")
 
 
-def images_to_pdf(items: list[tuple[str, bytes]]) -> bytes:
+def images_to_pdf(items: list[tuple[str, bytes]], progress: Progress = no_progress) -> bytes:
     """Склеивает картинки в один PDF: страница на картинку, размер страницы = размер картинки."""
     if not items:
         raise PdfToolsError("Нет картинок для конвертации")
     doc = pymupdf.open()
-    for name, data in items:
+    total = len(items)
+    for i, (name, data) in enumerate(items):
+        progress(i, total, f"Картинка {i + 1} из {total}: {name}")
         try:
             stream, width, height = _prepare(name, data)
             page = doc.new_page(width=width, height=height)
@@ -23,6 +26,7 @@ def images_to_pdf(items: list[tuple[str, bytes]]) -> bytes:
             raise
         except Exception as exc:
             raise PdfToolsError(f"«{name}»: не удалось обработать картинку") from exc
+    progress(total, total, "Сохранение PDF…")
     return doc.tobytes(garbage=3, deflate=True)
 
 

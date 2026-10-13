@@ -8,6 +8,7 @@ from .images_to_pdf import images_to_pdf
 from .merge import merge_pdfs
 from .naming import natural_key
 from .pdf_to_epub import pdf_to_epub
+from .progress import Progress, no_progress
 
 OUTPUT_DIR = "готово"
 IMAGE_EXTS = {".jpg", ".jpeg", ".gif", ".png", ".webp"}
@@ -25,26 +26,30 @@ def list_files(folder: Path, exts: set[str]) -> list[Path]:
     return sorted(files, key=lambda p: natural_key(p.name))
 
 
-def folder_images_to_pdf(folder: Path) -> list[Path]:
+def folder_images_to_pdf(folder: Path, progress: Progress = no_progress) -> list[Path]:
     folder = Path(folder).resolve()
     paths = list_files(folder, IMAGE_EXTS)
-    return _write_combined(folder, paths, images_to_pdf, _combined_name(folder))
+    return _write_combined(folder, paths, images_to_pdf, _combined_name(folder), progress)
 
 
-def folder_merge(folder: Path) -> list[Path]:
+def folder_merge(folder: Path, progress: Progress = no_progress) -> list[Path]:
     folder = Path(folder).resolve()
     paths = list_files(folder, PDF_EXTS)
-    return _write_combined(folder, paths, merge_pdfs, _combined_name(folder))
+    return _write_combined(folder, paths, merge_pdfs, _combined_name(folder), progress)
 
 
-def folder_compress(folder: Path, level: str = "medium") -> list[Path]:
+def folder_compress(folder: Path, level: str = "medium", progress: Progress = no_progress) -> list[Path]:
     if level not in LEVELS:
         raise PdfToolsError(f"Неизвестный уровень сжатия: {level}")
-    return _each_pdf(Path(folder).resolve(), ".pdf", lambda src, data: compress_pdf(data, level, src.name))
+    return _each_pdf(
+        Path(folder).resolve(), ".pdf", lambda src, data: compress_pdf(data, level, src.name), progress
+    )
 
 
-def folder_to_epub(folder: Path) -> list[Path]:
-    return _each_pdf(Path(folder).resolve(), ".epub", lambda src, data: pdf_to_epub(data, name=src.name))
+def folder_to_epub(folder: Path, progress: Progress = no_progress) -> list[Path]:
+    return _each_pdf(
+        Path(folder).resolve(), ".epub", lambda src, data: pdf_to_epub(data, name=src.name), progress
+    )
 
 
 def _read(paths: list[Path]) -> tuple[list[tuple[str, bytes]], list[str]]:
@@ -63,15 +68,19 @@ def _combined_name(folder: Path) -> str:
     return f"{folder.name or 'результат'}.pdf"
 
 
-def _write_combined(folder: Path, paths: list[Path], combine: Callable, output_name: str) -> list[Path]:
+def _write_combined(
+    folder: Path, paths: list[Path], combine: Callable, output_name: str, progress: Progress
+) -> list[Path]:
     """Combine files with per-file error detection on failure."""
+    progress(0, 0, f"Чтение файлов ({len(paths)})…")
     items, read_errors = _read(paths)
     if read_errors:
         raise PdfToolsError(_format_errors(read_errors))
 
     try:
-        result = combine(items)
+        result = combine(items, progress)
     except PdfToolsError as exc:
+        progress(0, 0, "Ищу все проблемные файлы…")
         # Try each file individually to identify per-file errors
         individual_errors = []
         for item in items:
@@ -85,6 +94,7 @@ def _write_combined(folder: Path, paths: list[Path], combine: Callable, output_n
         # If no individual file failed, use original error
         raise
 
+    progress(0, 0, "Запись результата…")
     return _write(folder, {output_name: result})
 
 
@@ -131,11 +141,16 @@ def _write(folder: Path, outputs: dict[str, bytes]) -> list[Path]:
     return [out / name for name in outputs.keys()]
 
 
-def _each_pdf(folder: Path, suffix: str, convert: Callable[[Path, bytes], bytes]) -> list[Path]:
+def _each_pdf(
+    folder: Path, suffix: str, convert: Callable[[Path, bytes], bytes], progress: Progress
+) -> list[Path]:
     """Обрабатывает все PDF в памяти; если хоть один упал — ничего не пишет."""
     outputs: dict[str, bytes] = {}
     errors: list[str] = []
-    for src in list_files(folder, PDF_EXTS):
+    sources = list_files(folder, PDF_EXTS)
+    total = len(sources)
+    for i, src in enumerate(sources):
+        progress(i, total, f"Файл {i + 1} из {total}: {src.name}")
         # Phase 1: Read bytes
         try:
             data = src.read_bytes()
@@ -151,6 +166,7 @@ def _each_pdf(folder: Path, suffix: str, convert: Callable[[Path, bytes], bytes]
 
     if errors:
         raise PdfToolsError(_format_errors(errors))
+    progress(total, total, "Запись результатов…")
     return _write(folder, outputs)
 
 

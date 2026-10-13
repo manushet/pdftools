@@ -13,6 +13,7 @@ from ebooklib import epub
 
 from .errors import PdfToolsError
 from .pdfio import open_pdf
+from .progress import Progress, no_progress
 
 MARGIN = 0.08            # доля высоты страницы сверху/снизу, где ищем колонтитулы
 MIN_IMAGE_PX = 50        # картинки меньше — декор, пропускаем
@@ -53,11 +54,18 @@ class Item:
     ext: str = ""
 
 
-def pdf_to_epub(data: bytes, title: str | None = None, author: str | None = None, name: str = "book.pdf") -> bytes:
+def pdf_to_epub(
+    data: bytes,
+    title: str | None = None,
+    author: str | None = None,
+    name: str = "book.pdf",
+    progress: Progress = no_progress,
+) -> bytes:
     """Reflowable EPUB: абзацы, заголовки-главы, картинки; без колонтитулов."""
     doc = open_pdf(name, data)
     try:
-        pages = _extract(doc)
+        pages = _extract(doc, progress)
+        progress(doc.page_count, doc.page_count, "Сборка книги…")
         if not any(b.kind == "text" for blocks in pages for b in blocks):
             raise PdfToolsError(SCAN_MESSAGE.format(name=name))
         blocks = _drop_running_heads(pages)
@@ -96,9 +104,11 @@ def _area(bbox) -> float:
     return max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
 
 
-def _extract(doc: pymupdf.Document) -> list[list[Block]]:
+def _extract(doc: pymupdf.Document, progress: Progress = no_progress) -> list[list[Block]]:
     pages = []
-    for page in doc:
+    total = doc.page_count
+    for i, page in enumerate(doc):
+        progress(i, total, f"Страница {i + 1} из {total}")
         height = page.rect.height
         page_area = page.rect.width * height
         blocks = []

@@ -2,7 +2,11 @@
 import logging
 import sys
 import threading
+import time
+import uuid
 import webbrowser
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import quote
@@ -21,17 +25,13 @@ from pdftools.errors import PdfToolsError
 from pdftools.images_to_pdf import images_to_pdf
 from pdftools.merge import merge_pdfs
 from pdftools.pdf_to_epub import pdf_to_epub
+from pdftools.progress import Progress
 
 HOST, PORT = "127.0.0.1", 8765
 STATIC = Path(__file__).parent / "static"
 log = logging.getLogger("pdftools")
 app = FastAPI(title="PDF Tools")
 _LOCK = threading.Lock()  # PyMuPDF не потокобезопасен
-
-
-def _run(fn, *args):
-    with _LOCK:
-        return fn(*args)
 
 ALLOWED_HOSTS = {f"{HOST}:{PORT}", "localhost:8765"}
 ALLOWED_ORIGINS = {f"http://{HOST}:{PORT}", "http://localhost:8765"}
@@ -95,24 +95,113 @@ async def index() -> FileResponse:
     return FileResponse(STATIC / "index.html")
 
 
+@dataclass
+class Job:
+    """Фоновая обработка: страница опрашивает её состояние и забирает результат."""
+    label: str = "В очереди…"
+    done: int = 0
+    total: int = 0
+    state: str = "running"  # running | done | error
+    error: str = ""
+    data: bytes = b""
+    filename: str = ""
+    media_type: str = ""
+    headers: dict[str, str] = field(default_factory=dict)
+    created: list[str] = field(default_factory=list)
+    finished_at: float = 0.0
+
+
+JOB_TTL = 600  # секунд: незабранные результаты удаляются, чтобы не держать память
+_JOBS: dict[str, Job] = {}
+
+
+def _forget_old_jobs() -> None:
+    now = time.monotonic()
+    for job_id, job in list(_JOBS.items()):
+        if job.finished_at and now - job.finished_at > JOB_TTL:
+            _JOBS.pop(job_id, None)
+
+
+def _start(task: Callable[[Job, Progress], None]) -> dict:
+    """Запускает task(job, progress) в фоне и сразу возвращает номер задачи."""
+    _forget_old_jobs()
+    job_id = uuid.uuid4().hex
+    job = _JOBS[job_id] = Job()
+
+    def progress(done: int, total: int, label: str) -> None:
+        job.done, job.total, job.label = done, total, label
+
+    def worker() -> None:
+        try:
+            with _LOCK:  # PyMuPDF не потокобезопасен: задачи идут по одной
+                task(job, progress)
+            job.state = "done"
+        except PdfToolsError as exc:
+            job.error, job.state = str(exc), "error"
+        except Exception:
+            log.exception("Unexpected error")
+            job.error, job.state = "Внутренняя ошибка, подробности в консоли.", "error"
+        job.finished_at = time.monotonic()
+
+    threading.Thread(target=worker, daemon=True).start()
+    return {"job": job_id}
+
+
+def _set_file(job: Job, data: bytes, filename: str, media_type: str, headers: dict[str, str] | None = None) -> None:
+    job.data, job.filename, job.media_type, job.headers = data, filename, media_type, headers or {}
+
+
+def _get_job(job_id: str) -> Job:
+    job = _JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Задача не найдена (устарела?) — запусти обработку ещё раз")
+    return job
+
+
+@app.get("/api/jobs/{job_id}")
+async def api_job_status(job_id: str) -> dict:
+    job = _get_job(job_id)
+    return {
+        "state": job.state, "done": job.done, "total": job.total, "label": job.label,
+        "error": job.error, "created": job.created,
+    }
+
+
+@app.get("/api/jobs/{job_id}/result")
+async def api_job_result(job_id: str) -> Response:
+    job = _get_job(job_id)
+    if job.state != "done" or not job.filename:
+        raise HTTPException(status_code=409, detail="Результат ещё не готов")
+    _JOBS.pop(job_id, None)
+    return _file_response(job.data, job.filename, job.media_type, job.headers)
+
+
 @app.post("/api/images-to-pdf")
-async def api_images_to_pdf(files: Annotated[list[UploadFile], File()]) -> Response:
-    data = await run_in_threadpool(_run, images_to_pdf, await _read_all(files))
-    return _file_response(data, "картинки.pdf", "application/pdf")
+async def api_images_to_pdf(files: Annotated[list[UploadFile], File()]) -> dict:
+    items = await _read_all(files)
+    return _start(lambda job, progress: _set_file(
+        job, images_to_pdf(items, progress), "картинки.pdf", "application/pdf"))
 
 
 @app.post("/api/merge")
-async def api_merge(files: Annotated[list[UploadFile], File()]) -> Response:
-    data = await run_in_threadpool(_run, merge_pdfs, await _read_all(files))
-    return _file_response(data, "объединённый.pdf", "application/pdf")
+async def api_merge(files: Annotated[list[UploadFile], File()]) -> dict:
+    items = await _read_all(files)
+    return _start(lambda job, progress: _set_file(
+        job, merge_pdfs(items, progress), "объединённый.pdf", "application/pdf"))
 
 
 @app.post("/api/compress")
-async def api_compress(file: Annotated[UploadFile, File()], level: Annotated[str, Form()] = "medium") -> Response:
+async def api_compress(file: Annotated[UploadFile, File()], level: Annotated[str, Form()] = "medium") -> dict:
     original = await file.read()
-    data = await run_in_threadpool(_run, compress_pdf, original, level, file.filename or "PDF")
-    sizes = {"X-Original-Size": str(len(original)), "X-New-Size": str(len(data))}
-    return _file_response(data, f"{_stem(file.filename)}.pdf", "application/pdf", sizes)
+    name = file.filename or "PDF"
+
+    def task(job: Job, progress: Progress) -> None:
+        progress(0, 0, f"Сжатие картинок: {name}")
+        data = compress_pdf(original, level, name)
+        sizes = {"X-Original-Size": str(len(original)), "X-New-Size": str(len(data))}
+        _set_file(job, data, f"{_stem(file.filename)}.pdf", "application/pdf", sizes)
+
+    return _start(task)
 
 
 @app.post("/api/epub")
@@ -120,12 +209,15 @@ async def api_epub(
     file: Annotated[UploadFile, File()],
     title: Annotated[str, Form()] = "",
     author: Annotated[str, Form()] = "",
-) -> Response:
+) -> dict:
     original = await file.read()
-    data = await run_in_threadpool(
-        _run, pdf_to_epub, original, title.strip() or None, author.strip() or None, file.filename or "book.pdf"
-    )
-    return _file_response(data, f"{_stem(file.filename)}.epub", "application/epub+zip")
+    name = file.filename or "book.pdf"
+    return _start(lambda job, progress: _set_file(
+        job,
+        pdf_to_epub(original, title.strip() or None, author.strip() or None, name, progress),
+        f"{_stem(file.filename)}.epub",
+        "application/epub+zip",
+    ))
 
 
 class FolderRequest(BaseModel):
@@ -141,10 +233,10 @@ class FolderRequest(BaseModel):
 
 
 FOLDER_ACTIONS = {
-    "images": lambda req: folder.folder_images_to_pdf(req.folder()),
-    "merge": lambda req: folder.folder_merge(req.folder()),
-    "compress": lambda req: folder.folder_compress(req.folder(), req.level),
-    "epub": lambda req: folder.folder_to_epub(req.folder()),
+    "images": lambda req, progress: folder.folder_images_to_pdf(req.folder(), progress),
+    "merge": lambda req, progress: folder.folder_merge(req.folder(), progress),
+    "compress": lambda req, progress: folder.folder_compress(req.folder(), req.level, progress),
+    "epub": lambda req, progress: folder.folder_to_epub(req.folder(), progress),
 }
 
 
@@ -152,8 +244,12 @@ FOLDER_ACTIONS = {
 async def api_folder(action: str, req: FolderRequest) -> dict:
     if action not in FOLDER_ACTIONS:
         raise HTTPException(status_code=404, detail="Неизвестное действие")
-    created = await run_in_threadpool(_run, FOLDER_ACTIONS[action], req)
-    return {"created": [str(p) for p in created]}
+    req.folder()  # пустой путь — сразу ошибка, без фоновой задачи
+
+    def task(job: Job, progress: Progress) -> None:
+        job.created = [str(p) for p in FOLDER_ACTIONS[action](req, progress)]
+
+    return _start(task)
 
 
 def _ask_directory() -> str:
