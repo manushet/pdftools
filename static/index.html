@@ -130,13 +130,14 @@ function render(key, sec) {
     remove.title = "Убрать";
     remove.onclick = () => { state[key].splice(i, 1); render(key, sec); };
     li.append(label, remove);
-    li.addEventListener("dragstart", e => { e.dataTransfer.setData("text/plain", String(i)); li.classList.add("dragging"); });
+    li.addEventListener("dragstart", e => { e.dataTransfer.setData("application/x-pdftools-index", String(i)); li.classList.add("dragging"); });
     li.addEventListener("dragend", () => li.classList.remove("dragging"));
     li.addEventListener("dragover", e => e.preventDefault());
     li.addEventListener("drop", e => {
       e.preventDefault();
-      const from = Number(e.dataTransfer.getData("text/plain"));
-      if (Number.isNaN(from)) return;
+      const indexStr = e.dataTransfer.getData("application/x-pdftools-index");
+      if (!indexStr) return;
+      const from = Number(indexStr);
       const [moved] = state[key].splice(from, 1);
       state[key].splice(i, 0, moved);
       render(key, sec);
@@ -171,6 +172,7 @@ function setPath(value) {
 async function pickFolder(sec) {
   await busy(sec, async () => {
     const resp = await fetch("/api/pick-folder", { method: "POST" });
+    if (!resp.ok) return setStatus(sec, await errorText(resp), "err");
     const data = await resp.json();
     if (data.path) setPath(data.path);
     setStatus(sec, "");
