@@ -194,13 +194,19 @@ async function runFolder(key, sec) {
   });
 }
 
+// файл, брошенный мимо зоны, не должен открываться в браузере вместо страницы
+window.addEventListener("dragover", e => e.preventDefault());
+window.addEventListener("drop", e => e.preventDefault());
+
 function wire(key, sec) {
   const tool = TOOLS[key], drop = $(".drop", sec), input = $("input[type=file]", sec);
   const add = fileList => {
-    const picked = [...fileList];
+    const all = [...fileList];
+    // папка, перетащенная из Проводника, приходит как «файл» нулевого размера без типа
+    const picked = all.filter(f => !(f.size === 0 && f.type === "")).sort(byNumber);
     state[key] = tool.multiple ? [...state[key], ...picked] : picked.slice(0, 1);
-    state[key].sort(byNumber);
     render(key, sec);
+    if (picked.length < all.length) setStatus(sec, "Папки сюда не перетаскиваются — используй «Обработать папку»", "err");
   };
   drop.addEventListener("click", () => input.click());
   input.addEventListener("change", () => { add(input.files); input.value = ""; });

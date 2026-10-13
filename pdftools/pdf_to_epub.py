@@ -19,6 +19,8 @@ MIN_IMAGE_PX = 50        # картинки меньше — декор, про�
 HEADING_RATIO = 1.2      # во сколько раз шрифт крупнее основного, чтобы считаться заголовком
 H1_RATIO = 1.6
 MAX_HEADING_LEN = 150
+MAX_HEAD_LEN = 80        # колонтитул — короткий блок
+SCAN_COVER = 0.7         # картинка шире этой доли страницы при наличии текста — фон скана
 CHUNK_ITEMS = 150        # максимум элементов в одной главе-файле
 SENTENCE_END = tuple('.!?:;…»"”)')
 PAGE_NUMBER = re.compile(r"[-–—\s]*[0-9]{1,4}[-–—\s]*")
@@ -90,18 +92,27 @@ def _block_text(raw: dict) -> tuple[str, float]:
     return text, (sizes.most_common(1)[0][0] if sizes else 0.0)
 
 
+def _area(bbox) -> float:
+    return max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
+
+
 def _extract(doc: pymupdf.Document) -> list[list[Block]]:
     pages = []
     for page in doc:
         height = page.rect.height
+        page_area = page.rect.width * height
         blocks = []
-        for raw in page.get_text("dict", sort=True)["blocks"]:
+        raws = page.get_text("dict", sort=True)["blocks"]
+        has_text = any(r["type"] == 0 and _block_text(r)[0] for r in raws)
+        for raw in raws:
             y0, y1 = raw["bbox"][1], raw["bbox"][3]
             in_margin = y1 <= height * MARGIN or y0 >= height * (1 - MARGIN)
             if raw["type"] == 0:
                 text, size = _block_text(raw)
                 if text:
                     blocks.append(Block("text", text=text, size=size, in_margin=in_margin))
+            elif has_text and _area(raw["bbox"]) > page_area * SCAN_COVER:
+                continue  # скан-подложка под распознанным текстом
             elif raw.get("width", 0) >= MIN_IMAGE_PX and raw.get("height", 0) >= MIN_IMAGE_PX:
                 blocks.append(Block("image", image=raw["image"], ext=raw["ext"]))
         pages.append(blocks)
@@ -116,13 +127,14 @@ def _drop_running_heads(pages: list[list[Block]]) -> list[Block]:
     """Убирает колонтитулы (повторяются в полях на многих страницах) и номера страниц."""
     counts: Counter[str] = Counter()
     for blocks in pages:
-        counts.update({_signature(b.text) for b in blocks if b.kind == "text" and b.in_margin})
-    threshold = max(2, math.ceil(len(pages) / 2))
+        counts.update({_signature(b.text) for b in blocks if b.kind == "text" and b.in_margin and len(b.text) <= MAX_HEAD_LEN})
+    # настоящие книги чередуют колонтитулы (название книги / название главы), поэтому порог низкий
+    threshold = max(3, math.ceil(len(pages) * 0.05)) if len(pages) >= 3 else 2
     kept = []
     for blocks in pages:
         for b in blocks:
             if b.kind == "text" and b.in_margin and (
-                counts[_signature(b.text)] >= threshold or PAGE_NUMBER.fullmatch(b.text)
+                (len(b.text) <= MAX_HEAD_LEN and counts[_signature(b.text)] >= threshold) or PAGE_NUMBER.fullmatch(b.text)
             ):
                 continue
             kept.append(b)

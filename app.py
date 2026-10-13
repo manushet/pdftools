@@ -1,5 +1,6 @@
 """Локальный веб-интерфейс PDF Tools. Запуск: python app.py"""
 import logging
+import sys
 import threading
 import webbrowser
 from pathlib import Path
@@ -25,6 +26,12 @@ HOST, PORT = "127.0.0.1", 8765
 STATIC = Path(__file__).parent / "static"
 log = logging.getLogger("pdftools")
 app = FastAPI(title="PDF Tools")
+_LOCK = threading.Lock()  # PyMuPDF не потокобезопасен
+
+
+def _run(fn, *args):
+    with _LOCK:
+        return fn(*args)
 
 ALLOWED_HOSTS = {f"{HOST}:{PORT}", "localhost:8765"}
 ALLOWED_ORIGINS = {f"http://{HOST}:{PORT}", "http://localhost:8765"}
@@ -90,20 +97,20 @@ async def index() -> FileResponse:
 
 @app.post("/api/images-to-pdf")
 async def api_images_to_pdf(files: Annotated[list[UploadFile], File()]) -> Response:
-    data = await run_in_threadpool(images_to_pdf, await _read_all(files))
+    data = await run_in_threadpool(_run, images_to_pdf, await _read_all(files))
     return _file_response(data, "картинки.pdf", "application/pdf")
 
 
 @app.post("/api/merge")
 async def api_merge(files: Annotated[list[UploadFile], File()]) -> Response:
-    data = await run_in_threadpool(merge_pdfs, await _read_all(files))
+    data = await run_in_threadpool(_run, merge_pdfs, await _read_all(files))
     return _file_response(data, "объединённый.pdf", "application/pdf")
 
 
 @app.post("/api/compress")
 async def api_compress(file: Annotated[UploadFile, File()], level: Annotated[str, Form()] = "medium") -> Response:
     original = await file.read()
-    data = await run_in_threadpool(compress_pdf, original, level, file.filename or "PDF")
+    data = await run_in_threadpool(_run, compress_pdf, original, level, file.filename or "PDF")
     sizes = {"X-Original-Size": str(len(original)), "X-New-Size": str(len(data))}
     return _file_response(data, f"{_stem(file.filename)}.pdf", "application/pdf", sizes)
 
@@ -116,7 +123,7 @@ async def api_epub(
 ) -> Response:
     original = await file.read()
     data = await run_in_threadpool(
-        pdf_to_epub, original, title.strip() or None, author.strip() or None, file.filename or "book.pdf"
+        _run, pdf_to_epub, original, title.strip() or None, author.strip() or None, file.filename or "book.pdf"
     )
     return _file_response(data, f"{_stem(file.filename)}.epub", "application/epub+zip")
 
@@ -145,7 +152,7 @@ FOLDER_ACTIONS = {
 async def api_folder(action: str, req: FolderRequest) -> dict:
     if action not in FOLDER_ACTIONS:
         raise HTTPException(status_code=404, detail="Неизвестное действие")
-    created = await run_in_threadpool(FOLDER_ACTIONS[action], req)
+    created = await run_in_threadpool(_run, FOLDER_ACTIONS[action], req)
     return {"created": [str(p) for p in created]}
 
 
@@ -169,6 +176,8 @@ async def api_pick_folder() -> dict:
 
 
 def main() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")  # не падаем на консоли без UTF-8
     logging.basicConfig(level=logging.INFO)
     url = f"http://{HOST}:{PORT}"
     threading.Timer(1.0, webbrowser.open, [url]).start()
