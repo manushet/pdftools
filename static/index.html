@@ -30,6 +30,10 @@
   .status { margin-top: 14px; white-space: pre-wrap; }
   .status.ok { color: var(--ok); }
   .status.err { color: var(--err); }
+  .progress { margin-top: 14px; }
+  .progress progress { width: 100%; height: 10px; accent-color: var(--accent); }
+  .progress-label { color: var(--muted); font-size: 14px; margin-top: 4px; overflow-wrap: anywhere; }
+  .reset-row { justify-content: flex-end; border-top: 1px solid var(--line); padding-top: 12px; margin-bottom: 0; }
 </style>
 </head>
 <body>
@@ -64,7 +68,14 @@
       <button class="secondary pick">Выбрать папку…</button>
     </div>
     <button class="primary run-folder">Обработать папку</button>
+    <div class="progress" hidden>
+      <progress max="100"></progress>
+      <div class="progress-label"></div>
+    </div>
     <div class="status"></div>
+    <div class="row reset-row">
+      <button class="secondary reset" title="Очистить список файлов, поля и сообщения на этой вкладке">Сбросить</button>
+    </div>
   </section>
 </template>
 
@@ -110,10 +121,50 @@ async function errorText(resp) {
 async function busy(sec, fn) {
   const buttons = sec.querySelectorAll("button");
   buttons.forEach(b => b.disabled = true);
-  setStatus(sec, "Работаю…");
+  setStatus(sec, "");
   try { await fn(); }
   catch (e) { setStatus(sec, `Не удалось связаться с программой: ${e.message}`, "err"); }
-  finally { buttons.forEach(b => b.disabled = false); }
+  finally { buttons.forEach(b => b.disabled = false); setProgress(sec, null); }
+}
+
+// percent: число 0–100, undefined — бегущая полоса, null — спрятать
+function setProgress(sec, percent, label = "") {
+  const box = $(".progress", sec), bar = $("progress", box);
+  box.hidden = percent === null;
+  if (percent === undefined) bar.removeAttribute("value");
+  else if (percent !== null) bar.value = percent;
+  $(".progress-label", box).textContent = label;
+}
+
+// XHR вместо fetch — чтобы видеть процент загрузки файлов
+function uploadForm(url, form, sec) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url);
+    xhr.upload.onprogress = e => {
+      if (!e.lengthComputable) return;
+      const pct = Math.round(e.loaded / e.total * 100);
+      setProgress(sec, pct, `Загрузка файлов… ${pct}%`);
+    };
+    xhr.upload.onload = () => setProgress(sec, undefined, "Файлы загружены, начинаю обработку…");
+    xhr.onload = () => resolve(new Response(xhr.responseText, { status: xhr.status }));
+    xhr.onerror = () => reject(new Error("сеть недоступна"));
+    xhr.send(form);
+  });
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// опрашивает задачу, пока она не закончится; возвращает её итоговое состояние
+async function waitJob(jobId, sec) {
+  while (true) {
+    const resp = await fetch(`/api/jobs/${jobId}`);
+    if (!resp.ok) return { state: "error", error: await errorText(resp) };
+    const job = await resp.json();
+    if (job.state !== "running") return job;
+    setProgress(sec, job.total ? Math.round(job.done / job.total * 100) : undefined, job.label);
+    await sleep(300);
+  }
 }
 
 function render(key, sec) {
@@ -154,7 +205,14 @@ async function runUpload(key, sec) {
   if (tool.options === "level") form.append("level", $(".level", sec).value);
   if (tool.options === "meta") { form.append("title", $(".title", sec).value); form.append("author", $(".author", sec).value); }
   await busy(sec, async () => {
-    const resp = await fetch(tool.upload, { method: "POST", body: form });
+    setProgress(sec, 0, "Загрузка файлов… 0%");
+    const started = await uploadForm(tool.upload, form, sec);
+    if (!started.ok) return setStatus(sec, await errorText(started), "err");
+    const { job: jobId } = await started.json();
+    const job = await waitJob(jobId, sec);
+    if (job.state === "error") return setStatus(sec, job.error, "err");
+    setProgress(sec, 100, "Скачивание результата…");
+    const resp = await fetch(`/api/jobs/${jobId}/result`);
     if (!resp.ok) return setStatus(sec, await errorText(resp), "err");
     const name = filenameFrom(resp, "result");
     download(await resp.blob(), name);
@@ -189,8 +247,10 @@ async function runFolder(key, sec) {
       body: JSON.stringify({ path, level: $(".level", sec).value }),
     });
     if (!resp.ok) return setStatus(sec, await errorText(resp), "err");
-    const data = await resp.json();
-    setStatus(sec, "Создано:\n" + data.created.join("\n"), "ok");
+    setProgress(sec, undefined, "Начинаю…");
+    const job = await waitJob((await resp.json()).job, sec);
+    if (job.state === "error") return setStatus(sec, job.error, "err");
+    setStatus(sec, "Создано:\n" + job.created.join("\n"), "ok");
   });
 }
 
@@ -217,6 +277,17 @@ function wire(key, sec) {
   $(".pick", sec).addEventListener("click", () => pickFolder(sec));
   $(".run-folder", sec).addEventListener("click", () => runFolder(key, sec));
   $(".path", sec).addEventListener("input", e => setPath(e.target.value));
+  $(".reset", sec).addEventListener("click", () => reset(key, sec));
+}
+
+// очищает только текущую вкладку: файлы, поля, уровень сжатия и сообщение
+function reset(key, sec) {
+  state[key] = [];
+  render(key, sec);
+  sec.querySelectorAll("input[type=text]").forEach(input => input.value = "");
+  $(".level", sec).value = "medium";
+  setStatus(sec, "");
+  setProgress(sec, null);
 }
 
 function show(key) {
